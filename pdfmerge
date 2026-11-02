@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+pdfmerge - merge PDFs in natural order and compress for email.
+
+Zero pip dependencies: only Python 3 stdlib + Ghostscript.
+
+Content is never edited, reordered or re-flowed. Pages are concatenated in the
+order given, then the whole document is re-encoded to shrink embedded images
+and fonts. The page count is verified after every run.
+
+Examples:
+    pdfmerge                              # all PDFs in current dir -> merged.pdf
+    pdfmerge -o thesis.pdf                # choose output name
+    pdfmerge --exclude 2                  # skip 2.pdf
+    pdfmerge a.pdf b.pdf c.pdf            # explicit order
+    pdfmerge --max-size 5                 # auto-pick quality to fit 5 MB
+    pdfmerge -q printer                   # higher quality
+    pdfmerge --no-compress                # merge only, no re-encoding
+    pdfmerge -n                           # dry run: show order, do nothing
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# Ghostscript presets, smallest to largest output.
+QUALITIES = ["screen", "ebook", "printer", "prepress"]
+
+# Stamped into every output's metadata so that a later directory scan can
+# recognise an earlier merge and not fold it back in as an input.
+MARKER = "pdfmerge-output"
+
+QUALITY_HELP = {
+    "screen": "72 dpi images - smallest, fine for pure text",
+    "ebook": "150 dpi images - good default, scans stay readable",
+    "printer": "300 dpi images - print quality",
+    "prepress": "300 dpi, colour preserved - largest",
+}
+
+
+def die(msg):
+    print(f"pdfmerge: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def natural_key(path):
+    """Sort so 2.pdf comes before 10.pdf, and 'ch2' before 'ch10'."""
+    name = os.path.basename(path).lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+
+def human(nbytes):
+    return f"{nbytes / 1048576:.2f} MB"
+
+
+def find_gs():
+    gs = shutil.which("gs") or shutil.which("gswin64c")
+    if not gs:
+        die(
+            "Ghostscript not found.\n"
+            "  macOS:  brew install ghostscript\n"
+            "  Debian: sudo apt install ghostscript"
+        )
+    return gs
+
+
+def page_count(gs, pdf):
+    """Page count via Ghostscript, so we need no PDF library."""
+    try:
+        out = subprocess.run(
+            [gs, "-q", "-dNODISPLAY", "-dNOSAFER", "-c",
+             f"({pdf}) (r) file runpdfbegin pdfpagecount = quit"],
+            capture_output=True, text=True, timeout=300,
+        )
+        return int(out.stdout.strip().splitlines()[-1])
+    except Exception:
+        return None
+
+
+def is_prior_output(path):
+    """True if this PDF was produced by pdfmerge (see MARKER)."""
+    try:
+        with open(path, "rb") as fh:
+            return MARKER.encode() in fh.read()
+    except OSError:
+        return False
+
+
+def collect(inputs, excludes, keep_outputs=False):
+    """Resolve inputs into an ordered list of PDF paths.
+
+    Files named explicitly are always honoured. Files discovered by scanning a
+    directory are filtered: an earlier pdfmerge output would otherwise be
+    merged into the new one, silently doubling the document.
+    """
+    files, skipped = [], []
+    if not inputs:
+        inputs = ["."]
+    for item in inputs:
+        if os.path.isdir(item):
+            found = [
+                os.path.join(item, f)
+                for f in os.listdir(item)
+                if f.lower().endswith(".pdf") and not f.startswith(".")
+            ]
+            for f in sorted(found, key=natural_key):
+                if not keep_outputs and is_prior_output(f):
+                    skipped.append(f)
+                else:
+                    files.append(f)
+        elif os.path.isfile(item):
+            files.append(item)
+        else:
+            die(f"no such file or directory: {item}")
+
+    if skipped:
+        print("Skipping earlier pdfmerge output(s): "
+              + ", ".join(os.path.basename(s) for s in skipped))
+        print("  (name them explicitly, or pass --include-outputs, to merge them)\n")
+
+    # --exclude matches a stem ("2"), a filename ("2.pdf") or a path.
+    if excludes:
+        wanted = {e.lower() for e in excludes}
+        wanted |= {e.lower().removesuffix(".pdf") for e in excludes}
+        kept = []
+        for f in files:
+            base = os.path.basename(f).lower()
+            if base in wanted or base.removesuffix(".pdf") in wanted:
+                continue
+            kept.append(f)
+        files = kept
+
+    # Drop duplicates while preserving order.
+    seen, unique = set(), []
+    for f in files:
+        key = os.path.realpath(f)
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return unique
+
+
+def run_gs(gs, inputs, output, quality, workdir):
+    # The pdfmark must come after the inputs: Ghostscript copies each input's
+    # metadata as it goes, so an earlier stamp would be overwritten.
+    markfile = os.path.join(workdir, "mark.ps")
+    with open(markfile, "w") as fh:
+        fh.write(f"[ /Creator ({MARKER}) /DOCINFO pdfmark\n")
+
+    cmd = [
+        gs, "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.7",
+        "-dNOPAUSE", "-dQUIET", "-dBATCH", "-dSAFER",
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true", "-dSubsetFonts=true",
+        f"-sOutputFile={output}",
+    ]
+    if quality:
+        cmd.insert(3, f"-dPDFSETTINGS=/{quality}")
+    cmd.extend(inputs)
+    cmd.append(markfile)
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        die(f"ghostscript failed:\n{res.stderr.strip()[:2000]}")
+    if not os.path.exists(output) or os.path.getsize(output) == 0:
+        die("ghostscript produced no output")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="pdfmerge",
+        description="Merge PDFs in natural order and compress for email.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="quality presets:\n"
+               + "\n".join(f"  {k:<9} {v}" for k, v in QUALITY_HELP.items()),
+    )
+    ap.add_argument("inputs", nargs="*",
+                    help="PDF files, or a directory (default: current dir)")
+    ap.add_argument("-o", "--output", default=None,
+                    help="output file (default: merged.pdf, written into the "
+                         "directory being merged)")
+    ap.add_argument("-q", "--quality", default="ebook",
+                    choices=QUALITIES, help="compression preset (default: ebook)")
+    ap.add_argument("--max-size", type=float, metavar="MB",
+                    help="try presets from best to worst until output fits MB")
+    ap.add_argument("-x", "--exclude", action="append", default=[], metavar="NAME",
+                    help="skip a file, e.g. -x 2 or -x draft.pdf (repeatable)")
+    ap.add_argument("--include-outputs", action="store_true",
+                    help="do not skip earlier pdfmerge outputs when scanning")
+    ap.add_argument("--no-compress", action="store_true",
+                    help="merge only, skip re-encoding")
+    ap.add_argument("-f", "--force", action="store_true",
+                    help="overwrite the output file if it exists")
+    ap.add_argument("-n", "--dry-run", action="store_true",
+                    help="show the merge order and exit")
+
+    args = ap.parse_args()
+    gs = find_gs()
+
+    # Default the output into the directory being merged, so that
+    # `pdfmerge ~/some/scans` leaves merged.pdf beside those scans rather
+    # than in whatever directory you happened to be standing in.
+    if args.output is None:
+        if len(args.inputs) == 1 and os.path.isdir(args.inputs[0]):
+            args.output = os.path.join(args.inputs[0], "merged.pdf")
+        else:
+            args.output = "merged.pdf"
+
+    files = collect(args.inputs, args.exclude, args.include_outputs)
+    if not files:
+        die("no PDF files found")
+
+    # Never consume our own output as an input.
+    out_real = os.path.realpath(args.output)
+    files = [f for f in files if os.path.realpath(f) != out_real]
+    if not files:
+        die("no input PDFs left after excluding the output file")
+
+    # Report the order and page ranges before doing anything.
+    print(f"Merging {len(files)} file(s) in this order:\n")
+    counts, total, unknown = [], 0, False
+    for f in files:
+        n = page_count(gs, os.path.abspath(f))
+        counts.append(n)
+        if n is None:
+            unknown = True
+            print(f"  {os.path.basename(f):<34} {'? pages':>12}")
+        else:
+            rng = f"{total + 1}-{total + n}" if n > 1 else f"{total + 1}"
+            print(f"  {os.path.basename(f):<34} {n:>4} pages   -> {rng}")
+            total += n
+    src_bytes = sum(os.path.getsize(f) for f in files)
+    print(f"\n  {'total':<34} {total:>4} pages   {human(src_bytes)}")
+
+    if args.dry_run:
+        print("\nDry run - nothing written.")
+        return
+
+    if os.path.exists(args.output) and not args.force:
+        die(f"{args.output} already exists (use -f to overwrite, or -o NAME)")
+
+    abs_inputs = [os.path.abspath(f) for f in files]
+    tmp_dir = tempfile.mkdtemp(prefix="pdfmerge-")
+    tmp_out = os.path.join(tmp_dir, "out.pdf")
+    try:
+        if args.no_compress:
+            print("\nMerging (no compression)...")
+            run_gs(gs, abs_inputs, tmp_out, None, tmp_dir)
+            chosen = None
+        elif args.max_size:
+            limit = args.max_size * 1048576
+            chosen = None
+            # Best quality first; stop at the first preset that fits.
+            for qual in reversed(QUALITIES):
+                print(f"\nTrying quality '{qual}'...", end=" ", flush=True)
+                run_gs(gs, abs_inputs, tmp_out, qual, tmp_dir)
+                size = os.path.getsize(tmp_out)
+                print(human(size))
+                chosen = qual
+                if size <= limit:
+                    break
+            if os.path.getsize(tmp_out) > limit:
+                print(f"\nWarning: could not reach {args.max_size} MB; "
+                      f"kept the smallest result ('{chosen}').", file=sys.stderr)
+        else:
+            print(f"\nMerging and compressing (quality: {args.quality})...")
+            run_gs(gs, abs_inputs, tmp_out, args.quality, tmp_dir)
+            chosen = args.quality
+
+        # Verify: no page may be lost.
+        out_pages = page_count(gs, tmp_out)
+        if out_pages is None or unknown:
+            print("\nWarning: could not verify page count.", file=sys.stderr)
+        elif out_pages != total:
+            die(f"page count mismatch: expected {total}, got {out_pages}. "
+                f"Output discarded; re-run with --no-compress.")
+
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".",
+                    exist_ok=True)
+        shutil.move(tmp_out, args.output)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    final = os.path.getsize(args.output)
+    pct = (1 - final / src_bytes) * 100 if src_bytes else 0
+    print(f"\nWrote {os.path.abspath(args.output)}")
+    print(f"  pages:   {out_pages if out_pages else total} (verified)")
+    print(f"  size:    {human(src_bytes)} -> {human(final)}  ({pct:.0f}% smaller)")
+    if chosen:
+        print(f"  quality: {chosen}")
+    if final > 25 * 1048576:
+        print("  note:    over 25 MB - too big for most email. "
+              "Try --max-size 20", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
